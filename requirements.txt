@@ -1,6 +1,6 @@
 clu
-jax[cuda12]
-tensorflow[and-cuda]
+jax[cuda12] >= 0.4.32
+tensorflow
 tensorflow-datasets
 chex==0.1.85
 optax

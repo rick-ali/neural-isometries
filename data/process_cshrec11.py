@@ -44,16 +44,16 @@ NUM_CHANNELS = 16
 NUM_CLASS_TRAIN = 10 # 16
 NUM_CLASS_TEST = 4 
 
-DATA_DIR = '' # SET THIS TO: Directory storing unzipped Conformal Shrec 11 Dataset dataset (https://www.dropbox.com/scl/fi/nofmj3nfdzxm4uwhumo75/SHREC_11_CONF.zip?rlkey=3qst50619xg31bzax6jqzf3cm&st=r2qzzjbg&dl=0)
+DATA_DIR = '/home/rma55/git-repos/neural-isometries/data/SHREC_11/SHREC_11_CONF' # SET THIS TO: Directory storing unzipped Conformal Shrec 11 Dataset dataset (https://www.dropbox.com/scl/fi/nofmj3nfdzxm4uwhumo75/SHREC_11_CONF.zip?rlkey=3qst50619xg31bzax6jqzf3cm&st=r2qzzjbg&dl=0)
 
-PROCESSED_DIR = '' # SET THIS TO: Directory storing output .tfrecord files
+PROCESSED_DIR = '/home/rma55/git-repos/neural-isometries/data/SHREC_11/processed' # SET THIS TO: Directory storing output .tfrecord files
 
 SKIP = ["glasses", "lamp", "snake", "two_balls", 'myScissor'] 
 
 BASE_DIR = os.path.join(DATA_DIR, "base")
-MOB_DIR = os.path.join(DATA_DIR, "mobius")
+MOB_DIR = os.path.join(DATA_DIR, "conf_aug")
 SBASE_DIR = os.path.join(DATA_DIR, "base_sphere")
-SMOB_DIR = os.path.join(DATA_DIR, "mobius_sphere")
+SMOB_DIR = os.path.join(DATA_DIR, "conf_aug_sphere")
 
 test_dir = os.path.join(PROCESSED_DIR, "test")
 train_dir = os.path.join(PROCESSED_DIR, "train")
@@ -167,7 +167,7 @@ if __name__ == '__main__':
     
     mesh_files = os.listdir(CBASE_DIR)
 
-    mesh_files = mesh_files[np.random.permutation(len(mesh_files))][:NUM_CLASS_TRAIN+NUM_CLASS_TEST]
+    mesh_files = np.array(mesh_files)[np.random.permutation(len(mesh_files))][:NUM_CLASS_TRAIN+NUM_CLASS_TEST]
     
     deviance = []
     for j, mf in enumerate(mesh_files):

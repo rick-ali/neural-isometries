@@ -1,0 +1,6 @@
+.venv
+data/SHREC_11/
+__pycache__
+wandb/
+cshrec11_encode/weights/
+cshrec11_pred/weights/
