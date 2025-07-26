@@ -194,7 +194,7 @@ def train_step(x: Any, labels: Any, model: nn.Module, encoder: nn.Module, kernel
 
     grad = jax.lax.pmean( grad, axis_name=PMAP_AXIS )
 
-    grad = jax.tree_map( jnp.conj, grad )
+    grad = jax.tree.map( jnp.conj, grad )
 
     updates, opt_state = optimizer.update( grad, state.opt_state, state.params )
     params             = optax.apply_updates( state.params, updates )
