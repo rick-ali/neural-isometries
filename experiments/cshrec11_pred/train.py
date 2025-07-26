@@ -3,11 +3,12 @@
 Train.
 
 Usage:
-  train [options]
+  train [options] [--linear]
   train (-h | --help)
   train --version
 
-Options:  
+Options:
+  --linear                Use linear latent transformation (matrix W) instead of kernel (default: False).
   -h --help                   Show this screen.
   --version                   Show version.
   -i, --in=<input_dir>        Input directory [default: {root_path}/data/CSHREC_11/].
@@ -151,27 +152,37 @@ class EvalMetrics(metrics.Collection):
   
 
 def train_step(x: Any, labels: Any, model: nn.Module, encoder: nn.Module, kernel: Any, 
-               state: TrainState, optimizer: Any, train: bool = True):
+               state: TrainState, optimizer: Any, train: bool = True, linear: bool = False):
   
   key  = state.key 
   step = state.step + 1
   
-  def loss_fn( params ):
-     
-    z = encoder.apply( {"params": params["encoder"]}, x )
+  def loss_fn(params):
+    z = encoder.apply({"params": params["encoder"]}, x)
     z = jnp.reshape(z, (z.shape[0], -1, z.shape[-1]))
     z = jax.lax.stop_gradient(z)
-    
-      
-    _, Omega = kernel.apply({"params":params["kernel"]}, z, z)
 
-    z0_b  = jnp.einsum( "...lj, ...lm->...jm", Omega[0][None, ...], Omega[2][None, ..., None] * z )
+    if linear:
+      # LINEAR MODE: Use W to map z to zW, classify on zW
+      W = params.get("W", jnp.eye(z.shape[-1]))
+      zW = jnp.einsum('...ij,jk->...ik', z, W)
+      logits = model.apply({'params': params["model"]}, zW)
+      # Return dummy Omega for downstream compatibility
+      batch_size = z.shape[0]
+      num_latents = z.shape[1]
+      Omega = (
+          jnp.zeros((num_latents, num_latents), dtype=jnp.float32),   # Omega[0]
+          jnp.zeros((num_latents,), dtype=jnp.float32),               # Omega[1]
+          jnp.zeros((num_latents,), dtype=jnp.float32)                # Omega[2]
+      )
+    else:
+      # KERNEL MODE: original logic
+      _, Omega = kernel.apply({"params": params["kernel"]}, z, z)
+      z0_b = jnp.einsum("...lj, ...lm->...jm", Omega[0][None, ...], Omega[2][None, ..., None] * z)
+      logits = model.apply({'params': params["model"]}, z0_b)
 
-    logits = model.apply({'params': params["model"]}, z0_b)
-
-    one_hot = jax.nn.one_hot(labels, logits.shape[-1]) 
-    loss = jnp.mean(optax.softmax_cross_entropy(logits=logits, labels=one_hot)) 
-    
+    one_hot = jax.nn.one_hot(labels, logits.shape[-1])
+    loss = jnp.mean(optax.softmax_cross_entropy(logits=logits, labels=one_hot))
     return loss, (logits,) 
  
   if train: 
@@ -384,7 +395,8 @@ def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, load_weight_d
 '''
 
 if __name__ == '__main__':
-  arguments = docopt( __doc__, version='Train 1.0' )
+  arguments = docopt(__doc__, version='Train 1.0')
+  linear = arguments['--linear']
 
   # Set up experiment directory
   in_dir = arguments['--in']

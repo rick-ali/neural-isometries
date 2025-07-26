@@ -2,7 +2,7 @@
 Train.
 
 Usage:
-  train [options]
+  train [options] [--linear]
   train (-h | --help)
   train --version
 
@@ -12,6 +12,7 @@ Options:
   -i, --in=<input_dir>    Input directory  [default: {root_path}/data/CSHREC_11/processed/]. 
   -o, --out=<output_dir>  Output directory [default: {root_path}/experiments/cshrec11_encode/weights/].
   -c, --config=<config>   Config directory [default: config].
+  --linear                Use linear latent transformation (matrix W) instead of kernel (default: False).
 """
 
 import os
@@ -87,10 +88,14 @@ def create_train_state( cfg: Any, data_shape: Tuple ) -> Tuple[nn.Module, nn.Mod
                               kernel_size = cfg.KERNEL_SIZE,
                               out_dim     = cfg.LATENT_DIM)
                               
-  decoder = conv.ConvDecoder( channels    = cfg.CONV_DEC_CHANNELS,
-                              block_depth = cfg.CONV_DEC_BLOCK_DEPTH,
-                              kernel_size = cfg.KERNEL_SIZE,
-                              out_dim     = data_shape[-1])
+  # Set decoder output channels based on mode: 2 for linear, 4 for kernel
+  decoder_out_groups = 2 if linear else 4
+  decoder = conv.ConvDecoder(
+      channels    = cfg.CONV_DEC_CHANNELS,
+      block_depth = cfg.CONV_DEC_BLOCK_DEPTH,
+      kernel_size = cfg.KERNEL_SIZE,
+      out_dim     = decoder_out_groups * data_shape[-1]
+  )
   
                        
   dec_input = jnp.ones( (data_shape[0], data_shape[1] // down_factor, data_shape[2] // down_factor, cfg.LATENT_DIM), dtype=jnp.float32 )
@@ -144,72 +149,87 @@ class EvalMetrics(metrics.Collection):
 
 
 def train_step(x: Any, encoder: nn.Module, decoder: nn.Module, kernel: Any, state: TrainState,
-               optimizer: Any, alpha_equiv: float, beta_mult: float, train: bool = True):
+               optimizer: Any, alpha_equiv: float, beta_mult: float, train: bool = True, linear: bool = False):
   
   key    = state.key 
   step   = state.step+1
   
   
   def loss_fn(params):
-     
     z = encoder.apply({"params": params["encoder"]}, x)
-   
     zH, zW, latent_dim = z.shape[1], z.shape[2], z.shape[3]
-  
-    z       = jnp.reshape(z, (-1, 2, zH, zW, latent_dim))
-  
-    z0      = jnp.reshape(z[:, 0, ...], (z.shape[0], -1, latent_dim))
-    Tz0     = jnp.reshape(z[:, 1, ...], (z.shape[0], -1, latent_dim))
-  
-    tauOmegaBA, Omega  = kernel.apply({"params": params["kernel"]}, z0, Tz0)
-    tauOmegaAB         = jnp.swapaxes(tauOmegaBA, -2, -1)    
+    z = jnp.reshape(z, (-1, 2, zH, zW, latent_dim))
+    z0 = jnp.reshape(z[:, 0, ...], (z.shape[0], -1, latent_dim))
+    Tz0 = jnp.reshape(z[:, 1, ...], (z.shape[0], -1, latent_dim))
 
-    # Project and transform
-    Tz0_p = jnp.einsum( "...jk, ...lk, ...lm->...jm", tauOmegaBA, Omega[0][None, ...], Omega[2][None, ..., None] * z0 )
-    z0_p  = jnp.einsum( "...jk, ...lk, ...lm->...jm", tauOmegaAB, Omega[0][None, ...], Omega[2][None, ..., None] * Tz0 )
+    if linear:
+      # LINEAR MODE: Use W to map z0 to Tz0, aggregate only z0 and Tz0, decode 2 outputs
+      # W should be a learnable parameter of shape (latent_dim, latent_dim)
+      W = params.get("W", jnp.eye(latent_dim))
+      Tz0 = jnp.einsum('...ij,jk->...ik', z0, W)  # shape: (batch, H*W, latent_dim)
+      # Optionally, you could use Tz0 = z0 @ W if shapes match
+      z_p = jnp.concatenate((z0[:, None, ...], Tz0[:, None, ...]), axis=1)
+      z_p = jnp.reshape(z_p, (-1, zH * zW, latent_dim))
+      z_p = jnp.reshape(z_p, (z_p.shape[0], zH, zW, latent_dim))
 
-    # Project 
-    z0_b  = jnp.einsum( "...lj, ...lm->...jm", Omega[0][None, ...], Omega[2][None, ..., None] * z0 )
-    Tz0_b = jnp.einsum( "...lj, ...lm->...jm", Omega[0][None, ...], Omega[2][None, ..., None] * Tz0 )
-    
-    
-    # Multiplicity and equivariance losses 
-    loss_mult  = losses.multiplicity_loss(Omega[1])
-        
-    loss_equiv = losses.l1_loss(Tz0_b, Tz0_p) + losses.l1_loss(z0_b, z0_p) 
-
-    # Unproject
-    Tz0_p = jnp.einsum( "...ij, ...jk->...ik", Omega[0][None, ...], Tz0_p )
-    z0_p  = jnp.einsum( "...ij, ...jk->...ik", Omega[0][None, ...], z0_p )
-    Tz0_b = jnp.einsum( "...ij, ...jk->...ik", Omega[0][None, ...], Tz0_b )
-    z0_b  = jnp.einsum( "...ij, ...jk->...ik", Omega[0][None, ...], z0_b )
-    
-   # Aggregate latents for decoding 
-    z_p      = jnp.concatenate((z0_b[:, None, ...], Tz0_b[:, None, ...], z0_p[:, None, ...], Tz0_p[:, None, ...]), axis=1)
-    z_p      = jnp.reshape(z_p, (-1, zH * zW, latent_dim))
-    z_p      = jnp.reshape(z_p, (z_p.shape[0], zH, zW, latent_dim))     
-    
-    
-
-    # Decode 
-    x_out     = decoder.apply({"params":params["decoder"]}, z_p)
-    
-    x_out     = jnp.reshape(x_out, (-1, 4, x.shape[1], x.shape[2], x.shape[3]))
-    
-    x0b_p     = x_out[:, 2, ...]
-    Tx0b_p    = x_out[:, 3, ...]
-    
-    xR        = jnp.reshape(x, (-1, 2, x.shape[1], x.shape[2], x.shape[3]))
-    x0        = xR[:, 0, ...]
-    Tx0       = xR[:, 1, ...]
-    
-    # Reconstruction loss 
-    loss_recon  = losses.l1_loss(x0, x0b_p) + losses.l1_loss(Tx0, Tx0b_p)
-    
-    # Total loss
-    loss      = loss_recon + alpha_equiv * loss_equiv + beta_mult * loss_mult 
-    
-    return loss, (loss_recon, loss_equiv, loss_mult, z_p, x_out, tauOmegaBA, Omega)
+      # Decode (2 outputs)
+      x_out = decoder.apply({"params": params["decoder"]}, z_p)
+      x_out = jnp.reshape(x_out, (-1, 2, x.shape[1], x.shape[2], x.shape[3]))
+      x0b_p = x_out[:, 0, ...]
+      Tx0b_p = x_out[:, 1, ...]
+      xR = jnp.reshape(x, (-1, 2, x.shape[1], x.shape[2], x.shape[3]))
+      x0 = xR[:, 0, ...]
+      Tx0 = xR[:, 1, ...]
+      # Only reconstruction loss is meaningful here
+      loss_recon = losses.l1_loss(x0, x0b_p) + losses.l1_loss(Tx0, Tx0b_p)
+      loss_equiv = 0.0
+      loss_mult = 0.0
+      loss = loss_recon
+      # Return dummy tauOmegaBA and Omega arrays with correct shapes for downstream compatibility
+      batch_size = z0.shape[0]
+      num_latents = z0.shape[1]
+      tauOmegaBA = jnp.zeros((batch_size, num_latents, num_latents), dtype=jnp.float32)
+      Omega = (
+          jnp.zeros((num_latents, num_latents), dtype=jnp.float32),   # Omega[0]
+          jnp.zeros((num_latents,), dtype=jnp.float32),               # Omega[1]
+          jnp.zeros((num_latents,), dtype=jnp.float32)                # Omega[2]
+      )
+      return loss, (loss_recon, loss_equiv, loss_mult, z_p, x_out, tauOmegaBA, Omega)
+    else:
+      # KERNEL MODE: original logic
+      tauOmegaBA, Omega = kernel.apply({"params": params["kernel"]}, z0, Tz0)
+      tauOmegaAB = jnp.swapaxes(tauOmegaBA, -2, -1)
+      # Project and transform
+      Tz0_p = jnp.einsum("...jk, ...lk, ...lm->...jm", tauOmegaBA, Omega[0][None, ...], Omega[2][None, ..., None] * z0)
+      z0_p = jnp.einsum("...jk, ...lk, ...lm->...jm", tauOmegaAB, Omega[0][None, ...], Omega[2][None, ..., None] * Tz0)
+      # Project
+      z0_b = jnp.einsum("...lj, ...lm->...jm", Omega[0][None, ...], Omega[2][None, ..., None] * z0)
+      Tz0_b = jnp.einsum("...lj, ...lm->...jm", Omega[0][None, ...], Omega[2][None, ..., None] * Tz0)
+      # Multiplicity and equivariance losses
+      loss_mult = losses.multiplicity_loss(Omega[1])
+      loss_equiv = losses.l1_loss(Tz0_b, Tz0_p) + losses.l1_loss(z0_b, z0_p)
+      # Unproject
+      Tz0_p = jnp.einsum("...ij, ...jk->...ik", Omega[0][None, ...], Tz0_p)
+      z0_p = jnp.einsum("...ij, ...jk->...ik", Omega[0][None, ...], z0_p)
+      Tz0_b = jnp.einsum("...ij, ...jk->...ik", Omega[0][None, ...], Tz0_b)
+      z0_b = jnp.einsum("...ij, ...jk->...ik", Omega[0][None, ...], z0_b)
+      # Aggregate latents for decoding
+      z_p = jnp.concatenate((z0_b[:, None, ...], Tz0_b[:, None, ...], z0_p[:, None, ...], Tz0_p[:, None, ...]), axis=1)
+      z_p = jnp.reshape(z_p, (-1, zH * zW, latent_dim))
+      z_p = jnp.reshape(z_p, (z_p.shape[0], zH, zW, latent_dim))
+      # Decode (4 outputs)
+      x_out = decoder.apply({"params": params["decoder"]}, z_p)
+      x_out = jnp.reshape(x_out, (-1, 4, x.shape[1], x.shape[2], x.shape[3]))
+      x0b_p = x_out[:, 2, ...]
+      Tx0b_p = x_out[:, 3, ...]
+      xR = jnp.reshape(x, (-1, 2, x.shape[1], x.shape[2], x.shape[3]))
+      x0 = xR[:, 0, ...]
+      Tx0 = xR[:, 1, ...]
+      # Reconstruction loss
+      loss_recon = losses.l1_loss(x0, x0b_p) + losses.l1_loss(Tx0, Tx0b_p)
+      # Total loss
+      loss = loss_recon + alpha_equiv * loss_equiv + beta_mult * loss_mult
+      return loss, (loss_recon, loss_equiv, loss_mult, z_p, x_out, tauOmegaBA, Omega)
 
   if train: 
     # Compute gradient
@@ -726,7 +746,8 @@ def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str ):
 '''
 
 if __name__ == '__main__':
-  arguments = docopt( __doc__, version='Train 1.0' )
+  arguments = docopt(__doc__, version='Train 1.0')
+  linear = arguments['--linear']
 
   # Set up experiment directory
   in_dir = arguments['--in']
@@ -765,5 +786,5 @@ if __name__ == '__main__':
   os.mkdir( exp_dir )
   ic( exp_dir )
   
-  train_and_evaluate( cfg, in_dir, exp_dir )
+  train_and_evaluate(cfg, in_dir, exp_dir, linear=linear)
 
