@@ -49,6 +49,7 @@ sys.path.append( ROOT_PATH )
 from nn import losses, conv, fmaps
 from utils import utils
 from utils.color import rwb_map, rwb_thick_map
+from utils.augmentations import d4_shrec_augment, random_d4_indices
 from data import data_loader as dl
 from data import input_pipeline, xforms
 from utils import ioutils as io
@@ -88,13 +89,11 @@ def create_train_state( cfg: Any, data_shape: Tuple, linear: bool = False ) -> T
                               kernel_size = cfg.KERNEL_SIZE,
                               out_dim     = cfg.LATENT_DIM)
                               
-  # Set decoder output channels based on mode: 2 for linear, 4 for kernel
-  decoder_out_groups = 2 if linear else 4
   decoder = conv.ConvDecoder(
       channels    = cfg.CONV_DEC_CHANNELS,
       block_depth = cfg.CONV_DEC_BLOCK_DEPTH,
       kernel_size = cfg.KERNEL_SIZE,
-      out_dim     = decoder_out_groups * data_shape[-1]
+      out_dim     = data_shape[-1]
   )
   
                        
@@ -147,6 +146,10 @@ class EvalMetrics(metrics.Collection):
   eval_equiv_loss   : metrics.Average.from_output("eval_equiv_loss") 
   eval_mult_loss   : metrics.Average.from_output("eval_mult_loss") 
 
+@jax.jit
+def d4_augment_no_grad(inputs, indices):
+  return jax.lax.stop_gradient(d4_shrec_augment(inputs, indices))
+
 
 def train_step(x: Any, encoder: nn.Module, decoder: nn.Module, kernel: Any, state: TrainState,
                optimizer: Any, alpha_equiv: float, beta_mult: float, train: bool = True, linear: bool = False):
@@ -154,58 +157,125 @@ def train_step(x: Any, encoder: nn.Module, decoder: nn.Module, kernel: Any, stat
   key    = state.key 
   step   = state.step+1
   
+  # Generate D4 indices outside loss_fn to avoid key scope issues in linear mode
+  if linear:
+    # Determine batch size from input shape - x has shape (batch_size * 2, H, W, C)
+    # After reshaping, x0 and Tx0 will have shape (batch_size, H, W, C)
+    batch_pairs = x.shape[0] // 2  # This gives us the actual batch size
+    key, d4_key = jax.random.split(key)
+    d4_indices = random_d4_indices(d4_key, batch_pairs)
+  else:
+    d4_indices = None
   
   def loss_fn(params):
-    z = encoder.apply({"params": params["encoder"]}, x)
-    zH, zW, latent_dim = z.shape[1], z.shape[2], z.shape[3]
-    z = jnp.reshape(z, (-1, 2, zH, zW, latent_dim))
-    z0 = jnp.reshape(z[:, 0, ...], (z.shape[0], -1, latent_dim))
-    Tz0 = jnp.reshape(z[:, 1, ...], (z.shape[0], -1, latent_dim))
-    
-    # Extract original and augmented images from x
-    # x has shape (batch_size * 2, H, W, C), representing pairs interleaved
-    # The pairs are arranged as: [item0_view0, item0_view1, item1_view0, item1_view1, ...]
-    # x_reshaped = jnp.reshape(x, (-1, 2, x.shape[1], x.shape[2], x.shape[3]))
-    # x0 = x_reshaped[:, 0, ...]  # Original images: [item0_view0, item1_view0, ...]
-    # Tx0 = x_reshaped[:, 1, ...]  # Augmented/transformed images: [item0_view1, item1_view1, ...]
-    # Now z0 corresponds to encoder(x0) and Tz0 corresponds to encoder(Tx)
-    # So z0[i] = encoder(x0[i]) and Tz0[i] = encoder(Tx[i]) where Tx[i] is augmented version of x0[i] 
+    if linear:      
+      # LINEAR MODE: D4 augmentation with equivariance learning (EFFICIENT VERSION)
+      # Extract original and transformed images from x
+      x_pairs = jnp.reshape(x, (-1, 2, x.shape[1], x.shape[2], x.shape[3]))
+      x0 = x_pairs[:, 0]  # Original images
+      Tx = x_pairs[:, 1]  # Transformed images
+      batch_size = x0.shape[0]
+      double_indices = jnp.tile(d4_indices, 2)  # Repeat indices for both x0 and Tx
+      
+      # EFFICIENT: Apply D4 augmentations in batched mode
+      # Stack inputs and indices for single augmentation call
+      aug_inputs = jnp.concatenate([x0, Tx], axis=0)  # Shape: (batch_size * 2, H, W, C)
+      
+      # Single D4 augmentation call for both x0 and Tx
+      aug_outputs = d4_augment_no_grad(aug_inputs, double_indices)
+      
+      # Split augmentation results
+      a = aug_outputs[:batch_size, ...]   # From x0
+      Ta = aug_outputs[batch_size:, ...]  # From Tx
+      
+      # EFFICIENT: Stack all inputs for single encoder forward pass
+      # Shape: (batch_size * 4, H, W, C) where the 4 inputs are [x0, Tx, a, Ta]
+      all_inputs = jnp.concatenate([x0, Tx, a, Ta], axis=0)
+      
+      # Single encoder forward pass for all inputs
+      all_z = encoder.apply({"params": params["encoder"]}, all_inputs)
+      zH, zW, latent_dim = all_z.shape[1], all_z.shape[2], all_z.shape[3]
+      
+      # Split the encoded results back into individual components
+      all_z_flat = jnp.reshape(all_z, (batch_size, 4, zH, zW, latent_dim))
+      z0_encoded = all_z_flat[:, 0, ...]  # From x0
+      Tz0_encoded = all_z_flat[:, 1, ...]  # From Tx
+      za = all_z_flat[:, 2, ...]  # From a
+      Tza = all_z_flat[:, 3, ...]  # From Ta
+      
+      # Reshape for further processing
+      z0 = jnp.reshape(z0_encoded, (batch_size, -1, latent_dim))
+      Tz0 = jnp.reshape(Tz0_encoded, (batch_size, -1, latent_dim))
+      za = jnp.reshape(za, (batch_size, -1, latent_dim))
+      Tza = jnp.reshape(Tza, (batch_size, -1, latent_dim))
+      
+      # EFFICIENT: Apply D4 transformation to latent features in batched mode
+      # Stack encoded features for single augmentation call
+      latent_aug_inputs = jnp.concatenate([z0_encoded, Tz0_encoded], axis=0)  # Shape: (batch_size * 2, zH, zW, latent_dim)
+      
+      # Single D4 augmentation call for both z0 and Tz0
+      latent_aug_outputs = d4_augment_no_grad(latent_aug_inputs, double_indices)
 
-    if linear:
-      # LINEAR MODE: Use W to map z0 to Tz0, aggregate only z0 and Tz0, decode 2 outputs
-      # W should be a learnable parameter of shape (latent_dim, latent_dim)
-      W = params.get("W", jnp.eye(latent_dim))
-      Tz0 = jnp.einsum('...ij,jk->...ik', z0, W)  # shape: (batch, H*W, latent_dim)
-      # Optionally, you could use Tz0 = z0 @ W if shapes match
-      z_p = jnp.concatenate((z0[:, None, ...], Tz0[:, None, ...]), axis=1)
-      z_p = jnp.reshape(z_p, (-1, zH * zW, latent_dim))
-      z_p = jnp.reshape(z_p, (z_p.shape[0], zH, zW, latent_dim))
-
-      # Decode (2 outputs)
+      # Split latent augmentation results
+      z0_aug_encoded = latent_aug_outputs[:batch_size, ...]   # From z0_encoded
+      Tz_aug_encoded = latent_aug_outputs[batch_size:, ...]   # From Tz0_encoded
+      
+      # Reshape augmented latents for further processing
+      z0_aug = jnp.reshape(z0_aug_encoded, (batch_size, -1, latent_dim))
+      Tz_aug = jnp.reshape(Tz_aug_encoded, (batch_size, -1, latent_dim))
+      
+      # Aggregate latents for decoding: [z0, Tz0, z0_aug, Tz_aug]
+      z_p = jnp.concatenate((z0[:, None, ...], Tz0[:, None, ...], z0_aug[:, None, ...], Tz_aug[:, None, ...]), axis=1)
+      z_p = jnp.reshape(z_p, (-1, zH, zW, latent_dim))
+      
+      # Decode all latents
       x_out = decoder.apply({"params": params["decoder"]}, z_p)
-      x_out = jnp.reshape(x_out, (-1, 2, x.shape[1], x.shape[2], x.shape[3]))
-      x0b_p = x_out[:, 0, ...]
-      Tx0b_p = x_out[:, 1, ...]
-      xR = jnp.reshape(x, (-1, 2, x.shape[1], x.shape[2], x.shape[3]))
-      x0 = xR[:, 0, ...]
-      Tx0 = xR[:, 1, ...]
-      # Only reconstruction loss is meaningful here
-      loss_recon = losses.l1_loss(x0, x0b_p) + losses.l1_loss(Tx0, Tx0b_p)
-      loss_equiv = 0.0
+      x_out = jnp.reshape(x_out, (-1, 4, x.shape[1], x.shape[2], x.shape[3]))
+      
+      # Extract reconstructions
+      x0_recon = x_out[:, 0, ...]    # From z0
+      Tx_recon = x_out[:, 1, ...]    # From Tz
+      a_recon = x_out[:, 2, ...]     # From z0_aug
+      Ta_recon = x_out[:, 3, ...]    # From Tz_aug
+      
+      # OPTIMIZED: Batch L1 loss computations to reduce function call overhead
+      # Stack targets and outputs for vectorized loss computation
+      recon_targets = jnp.stack([x0, Tx, a, Ta])  # Shape: (4, batch_size, H, W, C)
+      recon_outputs = jnp.stack([x0_recon, Tx_recon, a_recon, Ta_recon])  # Shape: (4, batch_size, H, W, C)
+      recon_weights = jnp.array([1.0, 1.0, 0.5, 0.5])  # Weights for each loss term
+      
+      # Compute L1 losses in batch: mean over spatial dimensions, then weight and sum
+      recon_l1_losses = jnp.mean(jnp.abs(recon_targets - recon_outputs), axis=(2, 3, 4))  # Shape: (4, batch_size)
+      loss_recon = jnp.sum(recon_weights[:, None] * recon_l1_losses)  # Weighted sum over loss types and batch
+      
+      # Batch equiv losses similarly
+      equiv_targets = jnp.stack([z0_aug, Tz_aug])  # Shape: (2, batch_size, num_latents, latent_dim)
+      equiv_outputs = jnp.stack([za, Tza])  # Shape: (2, batch_size, num_latents, latent_dim)
+      equiv_l1_losses = jnp.mean(jnp.abs(equiv_targets - equiv_outputs), axis=(2, 3))  # Shape: (2, batch_size)
+      loss_equiv = jnp.sum(equiv_l1_losses)  # Sum over both loss types and batch
+      
       loss_mult = 0.0
-      loss = loss_recon
-      # Return dummy tauOmegaBA and Omega arrays with correct shapes for downstream compatibility
+      loss = loss_recon + alpha_equiv * loss_equiv
+      
+      # Return dummy values for consistency with kernel mode
       batch_size = z0.shape[0]
       num_latents = z0.shape[1]
       tauOmegaBA = jnp.zeros((batch_size, num_latents, num_latents), dtype=jnp.float32)
       Omega = (
-          jnp.zeros((num_latents, num_latents), dtype=jnp.float32),   # Omega[0]
-          jnp.zeros((num_latents,), dtype=jnp.float32),               # Omega[1]
-          jnp.zeros((num_latents,), dtype=jnp.float32)                # Omega[2]
+          jnp.zeros((num_latents, num_latents), dtype=jnp.float32),
+          jnp.zeros((num_latents,), dtype=jnp.float32),
+          jnp.zeros((num_latents,), dtype=jnp.float32)
       )
+      
       return loss, (loss_recon, loss_equiv, loss_mult, z_p, x_out, tauOmegaBA, Omega)
     else:
       # KERNEL MODE: original logic
+      z = encoder.apply({"params": params["encoder"]}, x)
+      zH, zW, latent_dim = z.shape[1], z.shape[2], z.shape[3]
+      z       = jnp.reshape(z, (-1, 2, zH, zW, latent_dim))
+      z0      = jnp.reshape(z[:, 0, ...], (z.shape[0], -1, latent_dim))
+      Tz0     = jnp.reshape(z[:, 1, ...], (z.shape[0], -1, latent_dim))
+      
       tauOmegaBA, Omega = kernel.apply({"params": params["kernel"]}, z0, Tz0)
       tauOmegaAB = jnp.swapaxes(tauOmegaBA, -2, -1)
       # Project and transform
@@ -766,6 +836,10 @@ if __name__ == '__main__':
 
   out_dir = arguments['--out']
   out_dir = out_dir.format( root_path=ROOT_PATH )
+
+  # if linear, add suffix to output directory
+  if linear:
+    out_dir = f"{out_dir}linear"
 
   config = arguments['--config']
   path   = dirname( abspath(__file__) )

@@ -164,9 +164,7 @@ def train_step(x: Any, labels: Any, model: nn.Module, encoder: nn.Module, kernel
 
     if linear:
       # LINEAR MODE: Use W to map z to zW, classify on zW
-      W = params.get("W", jnp.eye(z.shape[-1]))
-      zW = jnp.einsum('...ij,jk->...ik', z, W)
-      logits = model.apply({'params': params["model"]}, zW)
+      logits = model.apply({'params': params["model"]}, z)
       # Return dummy Omega for downstream compatibility
       batch_size = z.shape[0]
       num_latents = z.shape[1]
@@ -406,6 +404,8 @@ if __name__ == '__main__':
 
   out_dir = arguments['--out']
   out_dir = out_dir.format( root_path=ROOT_PATH )
+  if linear:
+    out_dir = f"{out_dir}linear"
 
   weight_dir = arguments['--weights']
 
