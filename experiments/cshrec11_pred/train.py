@@ -225,7 +225,7 @@ def train_step(x: Any, labels: Any, model: nn.Module, encoder: nn.Module, kernel
 
 
        
-def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, load_weight_dir: str):
+def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, load_weight_dir: str, linear: bool = False):
   tf.io.gfile.makedirs( output_dir )
 
   '''
@@ -309,7 +309,8 @@ def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, load_weight_d
                                              encoder      = encoder,
                                              kernel       = kernel,
                                              optimizer    = optimizer,
-                                             train        = True),
+                                             train        = True,
+                                             linear       = linear),
                            axis_name=PMAP_AXIS )
     
   p_eval_step = jax.pmap( functools.partial(eval_fn,
@@ -317,7 +318,8 @@ def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, load_weight_d
                                              encoder      = encoder,
                                              kernel       = kernel,
                                              optimizer    = optimizer,
-                                             train        = False),
+                                             train        = False,
+                                             linear       = linear),
                           axis_name=PMAP_AXIS )
   
 
@@ -437,5 +439,5 @@ if __name__ == '__main__':
   ic( exp_dir )
 
   
-  train_and_evaluate( cfg, in_dir, exp_dir, weight_dir)
+  train_and_evaluate( cfg, in_dir, exp_dir, weight_dir, linear=linear)
 

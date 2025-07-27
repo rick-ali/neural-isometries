@@ -70,7 +70,7 @@ class TrainState:
   multi_steps : Any 
 
 
-def create_train_state( cfg: Any, data_shape: Tuple ) -> Tuple[nn.Module, nn.Module, Any, Any, Any, TrainState]:
+def create_train_state( cfg: Any, data_shape: Tuple, linear: bool = False ) -> Tuple[nn.Module, nn.Module, Any, Any, Any, TrainState]:
 
   # Random key 
   seed = 0 #np.random.randint(low=0, high=1e8, size=(1, ))[0]
@@ -161,6 +161,15 @@ def train_step(x: Any, encoder: nn.Module, decoder: nn.Module, kernel: Any, stat
     z = jnp.reshape(z, (-1, 2, zH, zW, latent_dim))
     z0 = jnp.reshape(z[:, 0, ...], (z.shape[0], -1, latent_dim))
     Tz0 = jnp.reshape(z[:, 1, ...], (z.shape[0], -1, latent_dim))
+    
+    # Extract original and augmented images from x
+    # x has shape (batch_size * 2, H, W, C), representing pairs interleaved
+    # The pairs are arranged as: [item0_view0, item0_view1, item1_view0, item1_view1, ...]
+    # x_reshaped = jnp.reshape(x, (-1, 2, x.shape[1], x.shape[2], x.shape[3]))
+    # x0 = x_reshaped[:, 0, ...]  # Original images: [item0_view0, item1_view0, ...]
+    # Tx0 = x_reshaped[:, 1, ...]  # Augmented/transformed images: [item0_view1, item1_view1, ...]
+    # Now z0 corresponds to encoder(x0) and Tz0 corresponds to encoder(Tx)
+    # So z0[i] = encoder(x0[i]) and Tz0[i] = encoder(Tx[i]) where Tx[i] is augmented version of x0[i] 
 
     if linear:
       # LINEAR MODE: Use W to map z0 to Tz0, aggregate only z0 and Tz0, decode 2 outputs
@@ -517,7 +526,7 @@ def viz_results( cfg, z, batch, x_out, tauOmega, Omega, mode="train", std_factor
   return wandb_ims 
 
  
-def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str ):
+def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, linear: bool = False ):
   tf.io.gfile.makedirs( output_dir )
   ic( output_dir )
   
@@ -586,7 +595,7 @@ def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str ):
 
   #Create models
   print( "Initializing models..." )
-  encoder, decoder, kernel, optimizer, xform_key, state = create_train_state( cfg, (batch_size, *input_size, 16) )
+  encoder, decoder, kernel, optimizer, xform_key, state = create_train_state( cfg, (batch_size, *input_size, 16), linear )
   print( "Done..." )
 
   # Create checkpoints
@@ -607,7 +616,8 @@ def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str ):
                                              optimizer    = optimizer,
                                              alpha_equiv  = alpha_equiv,
                                              beta_mult    = beta_mult,
-                                             train        = True),
+                                             train        = True,
+                                             linear       = linear),
                            axis_name=PMAP_AXIS )
     
   p_eval_step = jax.pmap( functools.partial(train_fn,
@@ -617,7 +627,8 @@ def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str ):
                                             kernel       = kernel,
                                             alpha_equiv  = alpha_equiv,
                                             beta_mult    = beta_mult,
-                                            train        = False),
+                                            train        = False,
+                                            linear       = linear),
                           axis_name=PMAP_AXIS ) 
   # Visualize 
   train_metrics = None
