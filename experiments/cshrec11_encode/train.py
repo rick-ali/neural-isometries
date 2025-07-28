@@ -672,9 +672,19 @@ def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, linear: bool 
   ic( jax.default_backend() )
 
   ## Set up meta-parameters 
-  true_batch_size = cfg.TRUE_BATCH_SIZE
-  batch_size      = cfg.BATCH_SIZE 
-  latent_dim      = cfg.LATENT_DIM 
+  # Override batch sizes for non-linear (kernel) mode
+  if not linear:
+    # Force batch sizes to 16 for kernel mode
+    true_batch_size = 16
+    batch_size = 16
+    print(f"Kernel mode: Using BATCH_SIZE={batch_size}, TRUE_BATCH_SIZE={true_batch_size}")
+  else:
+    # Use config values for linear mode
+    true_batch_size = cfg.TRUE_BATCH_SIZE
+    batch_size = cfg.BATCH_SIZE
+    print(f"Linear mode: Using BATCH_SIZE={batch_size}, TRUE_BATCH_SIZE={true_batch_size}")
+    
+  latent_dim = cfg.LATENT_DIM 
   
   multi_steps  = true_batch_size // batch_size 
   alpha_equiv  = cfg.ALPHA_EQUIV
