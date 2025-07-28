@@ -3,12 +3,14 @@
 Train.
 
 Usage:
-  train [options] [--linear]
+  train [options] [--linear] [--projection=<type>] [--freeze-encoder]
   train (-h | --help)
   train --version
 
 Options:
   --linear                Use linear latent transformation (matrix W) instead of kernel (default: False).
+  --projection=<type>     Projection type for linear mode: matrix, mlp, or conv [default: matrix].
+  --freeze-encoder        Freeze encoder weights during training (default: True).
   -h --help                   Show this screen.
   --version                   Show version.
   -i, --in=<input_dir>        Input directory [default: {root_path}/data/CSHREC_11/].
@@ -64,6 +66,121 @@ PMAP_AXIS = "batch"
 
 ######################
 
+# Projection Classes for Linear Mode
+class MLPProjection(nn.Module):
+    hidden_dim: int
+    output_dim: int
+    
+    @nn.compact
+    def __call__(self, x):
+        # x shape: (batch, spatial_dim, latent_dim)
+        # Two dense layers with same dimensions as requested
+        x = nn.Dense(self.output_dim)(x)
+        x = nn.relu(x)
+        x = nn.Dense(self.output_dim)(x)
+        return x
+
+class ConvProjection(nn.Module):
+    target_spatial_dim: int
+    latent_dim: int
+    encoder_spatial_h: int  # zH
+    encoder_spatial_w: int  # zW
+    
+    @nn.compact
+    def __call__(self, x):
+        # x shape: (batch, spatial_dim, latent_dim)
+        batch_size, spatial_dim, latent_dim = x.shape
+        
+        # Use the actual encoder spatial dimensions
+        zH, zW = self.encoder_spatial_h, self.encoder_spatial_w
+        
+        # Verify our understanding matches
+        assert zH * zW == spatial_dim, f"Spatial dimension mismatch: {zH}*{zW}={zH*zW} != {spatial_dim}"
+        
+        # Reshape to actual encoder output spatial layout
+        x = jnp.reshape(x, (batch_size, zH, zW, latent_dim))
+        
+        # Convolutional layers to reduce spatial dimensions
+        x = nn.Conv(features=latent_dim, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.relu(x)
+        
+        # Calculate target spatial dimensions (assuming square for target)
+        target_h = target_w = int(jnp.sqrt(self.target_spatial_dim))
+        
+        # Adaptive downsampling
+        if zH > target_h or zW > target_w:
+            stride_h = max(1, zH // target_h)
+            stride_w = max(1, zW // target_w)
+            stride = max(stride_h, stride_w)  # Use larger stride to ensure we don't exceed target
+            
+            x = nn.Conv(features=latent_dim, kernel_size=(3, 3), strides=(stride, stride), padding='SAME')(x)
+            x = nn.relu(x)
+        
+        # Final convolution
+        x = nn.Conv(features=latent_dim, kernel_size=(1, 1))(x)
+        
+        # Get actual output spatial dimensions after convolutions
+        actual_h, actual_w = x.shape[1], x.shape[2]
+        actual_spatial_dim = actual_h * actual_w
+        
+        # Reshape back to flattened spatial
+        x = jnp.reshape(x, (batch_size, actual_spatial_dim, latent_dim))
+        
+        # Final dense layer to get exact target dimension if needed
+        if actual_spatial_dim != self.target_spatial_dim:
+            x = nn.Dense(self.target_spatial_dim)(x.transpose(0, 2, 1)).transpose(0, 2, 1)
+        
+        return x
+
+class GeometricProjection(nn.Module):
+    target_spatial_dim: int
+    latent_dim: int
+    projection_type: str = "matrix"  # "matrix", "mlp", or "conv"
+    
+    @nn.compact  
+    def __call__(self, x):
+        batch_size, spatial_dim, latent_dim = x.shape
+        
+        if self.projection_type == "conv" and spatial_dim >= 16:  # Use conv for reasonable spatial dims
+            # Reshape to 2D spatial for convolution
+            spatial_size = int(jnp.sqrt(spatial_dim))
+            x = jnp.reshape(x, (batch_size, spatial_size, spatial_size, latent_dim))
+            
+            # Convolutional reduction
+            x = nn.Conv(features=latent_dim, kernel_size=(3, 3), padding='SAME')(x)
+            x = nn.relu(x)
+            
+            # Adaptive pooling to target size
+            target_size = int(jnp.sqrt(self.target_spatial_dim))
+            if spatial_size > target_size:
+                stride = max(1, spatial_size // target_size)
+                x = nn.Conv(features=latent_dim, kernel_size=(3, 3), strides=(stride, stride), padding='SAME')(x)
+                x = nn.relu(x)
+            
+            x = jnp.reshape(x, (batch_size, -1, latent_dim))
+            
+            # Final adjustment to exact target dimension if needed
+            if x.shape[1] != self.target_spatial_dim:
+                x = nn.Dense(self.target_spatial_dim)(x.transpose(0, 2, 1)).transpose(0, 2, 1)
+                
+        elif self.projection_type == "mlp":
+            # Use MLP projection with 2 dense layers
+            # First layer: project latent features 
+            x = nn.Dense(self.target_spatial_dim)(x)
+            x = nn.relu(x)
+            # Second layer: keep same dimension
+            x = nn.Dense(self.target_spatial_dim)(x)
+            
+            # Now project spatial dimension from enc_spatial_dim to target_spatial_dim
+            x = nn.Dense(self.target_spatial_dim)(x.transpose(0, 2, 1)).transpose(0, 2, 1)
+            
+        else:  # "matrix" - simple linear projection
+            # Simple linear projection via einsum (as before)
+            # This will be handled in the loss_fn to maintain backward compatibility
+            return x
+        
+        return x
+
 @flax.struct.dataclass
 class TrainState:
   step         : int
@@ -72,7 +189,7 @@ class TrainState:
   key          : Any 
 
 
-def create_train_state( cfg: Any, data_shape: Tuple, num_classes: int) -> Tuple[nn.Module, Any, Any, Any,  Any, TrainState]:
+def create_train_state( cfg: Any, data_shape: Tuple, num_classes: int, linear: bool = False, proj_type: str = "matrix") -> Tuple[nn.Module, Any, Any, Any,  Any, TrainState, Any]:
 
   # Random key 
   seed = 0 #np.random.randint(low=0, high=1e8, size=(1, ))[0]
@@ -111,13 +228,63 @@ def create_train_state( cfg: Any, data_shape: Tuple, num_classes: int) -> Tuple[
                     out_dim       = num_classes)
   
   
-  xform_dim = cfg.KERNEL_OP_DIM
-
-  model_input = jnp.ones( (data_shape[0], xform_dim, cfg.LATENT_DIM), dtype=jnp.float32)
+  # Calculate encoder output spatial dimension
+  down_factor = np.power(2, (len(cfg.CONV_ENC_CHANNELS) - 1))
+  enc_spatial_dim = (data_shape[1] // down_factor) * (data_shape[2] // down_factor)
+  
+  if linear:
+    # In linear mode, use encoder output dimensions and add projection
+    xform_dim = cfg.KERNEL_OP_DIM  # Target dimension after projection
+    model_input = jnp.ones( (data_shape[0], xform_dim, cfg.LATENT_DIM), dtype=jnp.float32)
+    
+    # Create projection based on type
+    if proj_type == "matrix":
+      # Simple matrix projection (backward compatibility)
+      proj_key, model_key = jax.random.split(model_key)
+      projection_matrix = jax.random.normal(proj_key, (enc_spatial_dim, cfg.KERNEL_OP_DIM)) * 0.01
+      projection_obj = None
+    else:
+      # Calculate actual encoder spatial dimensions (zH, zW)
+      encoder_h = data_shape[1] // down_factor  # This is zH
+      encoder_w = data_shape[2] // down_factor  # This is zW
+      
+      # Verify our calculation
+      assert encoder_h * encoder_w == enc_spatial_dim, f"Spatial calc mismatch: {encoder_h}*{encoder_w}={encoder_h*encoder_w} != {enc_spatial_dim}"
+      
+      if proj_type == "conv":
+        projection_obj = ConvProjection(
+          target_spatial_dim=cfg.KERNEL_OP_DIM,
+          latent_dim=cfg.LATENT_DIM,
+          encoder_spatial_h=encoder_h,  # Pass zH
+          encoder_spatial_w=encoder_w   # Pass zW
+        )
+      else:  # mlp
+        projection_obj = MLPProjection(
+          hidden_dim=cfg.KERNEL_OP_DIM,  # Keep for compatibility but not used
+          output_dim=cfg.KERNEL_OP_DIM
+        )
+      
+      # Initialize projection
+      proj_input = jnp.ones((data_shape[0], enc_spatial_dim, cfg.LATENT_DIM), dtype=jnp.float32)
+      proj_key, model_key = jax.random.split(model_key)
+      projection_params = projection_obj.init(proj_key, proj_input)["params"]
+      projection_matrix = None
+  else:
+    # In kernel mode, use kernel operator dimensions
+    xform_dim = cfg.KERNEL_OP_DIM
+    model_input = jnp.ones( (data_shape[0], xform_dim, cfg.LATENT_DIM), dtype=jnp.float32)
+    projection_matrix = None
+    projection_obj = None
 
   model_params = model.init(model_key, model_input)["params"]
 
-  params        = {"encoder": enc_params,  "kernel": kernel_params, "model": model_params} 
+  if linear:
+    if proj_type == "matrix":
+      params = {"encoder": enc_params, "kernel": kernel_params, "model": model_params, "projection": projection_matrix}
+    else:
+      params = {"encoder": enc_params, "kernel": kernel_params, "model": model_params, "projection_obj": projection_params}
+  else:
+    params = {"encoder": enc_params, "kernel": kernel_params, "model": model_params} 
 
 
   # Set up optimizer 
@@ -138,7 +305,7 @@ def create_train_state( cfg: Any, data_shape: Tuple, num_classes: int) -> Tuple[
   state       = optimizer.init( params ) 
   train_state = TrainState( step=0, opt_state=state, params=params, key=key )
 
-  return model, encoder, kernel, optimizer, xform_key, train_state
+  return model, encoder, kernel, optimizer, xform_key, train_state, projection_obj
 
 @flax.struct.dataclass
 class TrainMetrics(metrics.Collection):
@@ -152,7 +319,7 @@ class EvalMetrics(metrics.Collection):
   
 
 def train_step(x: Any, labels: Any, model: nn.Module, encoder: nn.Module, kernel: Any, 
-               state: TrainState, optimizer: Any, train: bool = True, linear: bool = False):
+               state: TrainState, optimizer: Any, train: bool = True, linear: bool = False, projection_obj: Any = None, freeze_encoder: bool = True):
   
   key  = state.key 
   step = state.step + 1
@@ -160,11 +327,25 @@ def train_step(x: Any, labels: Any, model: nn.Module, encoder: nn.Module, kernel
   def loss_fn(params):
     z = encoder.apply({"params": params["encoder"]}, x)
     z = jnp.reshape(z, (z.shape[0], -1, z.shape[-1]))
-    z = jax.lax.stop_gradient(z)
+    
+    # Conditionally freeze encoder based on command line argument
+    if freeze_encoder:
+      z = jax.lax.stop_gradient(z)
 
     if linear:
-      # LINEAR MODE: Use W to map z to zW, classify on zW
-      logits = model.apply({'params': params["model"]}, z)
+      # Apply learnable projection from enc_spatial_dim to KERNEL_OP_DIM
+      # z shape: (batch, enc_spatial_dim, latent_dim)
+      if "projection" in params:
+        # Matrix projection (backward compatibility)
+        # projection_matrix shape: (enc_spatial_dim, KERNEL_OP_DIM)
+        # Result: (batch, KERNEL_OP_DIM, latent_dim)
+        z_proj = jnp.einsum('bsl,sk->bkl', z, params["projection"])
+      else:
+        # Use GeometricProjection (mlp/conv)
+        z_proj = projection_obj.apply({'params': params["projection_obj"]}, z)
+      
+      logits = model.apply({'params': params["model"]}, z_proj)
+      
       # Return dummy Omega for downstream compatibility
       batch_size = z.shape[0]
       num_latents = z.shape[1]
@@ -223,15 +404,57 @@ def train_step(x: Any, labels: Any, model: nn.Module, encoder: nn.Module, kernel
 
 
        
-def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, load_weight_dir: str, linear: bool = False):
+def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, load_weight_dir: str, linear: bool = False, proj_type: str = "matrix", freeze_encoder: bool = True):
   tf.io.gfile.makedirs( output_dir )
 
   '''
   ========== Setup W&B =============
   '''
-  exp_name     =  "niso_{}_kop_{}_ld_{}d_cshrec11_pred".format( cfg.KERNEL_OP_DIM,
-                                                            cfg.LATENT_DIM,
-                                                            len(cfg.CONV_ENC_CHANNELS)-1)
+  
+  # Extract experiment number from weight directory
+  # weight_dir format: .../experiments/cshrec11_encode/weights/0/ or similar
+  weight_exp_num = "unknown"
+  weight_has_linear = False
+  
+  if load_weight_dir:
+    # Check if "linear" is in the path
+    weight_has_linear = "linear" in load_weight_dir.lower()
+    
+    # Extract the experiment number (last directory in the path that's numeric)
+    path_parts = load_weight_dir.rstrip('/').split('/')
+    for part in reversed(path_parts):
+      if part.isdigit():
+        weight_exp_num = part
+        break
+  
+  # Create weight suffix with linear indicator if present
+  if weight_has_linear:
+    weight_suffix = f"linear_weights_exp_{weight_exp_num}"
+  else:
+    weight_suffix = f"weights_exp_{weight_exp_num}"
+  
+  # base_name = "niso_{}_kop_{}_ld_{}d_cshrec11_pred".format( cfg.KERNEL_OP_DIM,
+  #                                                           cfg.LATENT_DIM,
+  #                                                           len(cfg.CONV_ENC_CHANNELS)-1)
+  base_name = "cshrec11_pred"
+  # Add suffixes based on configuration
+  suffixes = []
+  
+  # Add weights experiment number with latent indicator
+  suffixes.append(weight_suffix)
+  
+  if linear:
+    suffixes.append(f"linear_{proj_type}")
+  else:
+    suffixes.append("kernel")
+    
+  if not freeze_encoder:
+    suffixes.append("unfrozen_enc")
+  else:
+    suffixes.append("frozen_enc")
+  
+  exp_name = base_name + "_" + "_".join(suffixes)
+  
   project_name      = cfg.PROJECT_NAME 
   cfg.WORK_DIR      = output_dir 
   cfg.PRE_TRAIN_DIR = load_weight_dir 
@@ -286,7 +509,7 @@ def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, load_weight_d
   #Create models
   print( "Initializing models..." )    
     
-  model, encoder, kernel, optimizer, xform_key, state = create_train_state(cfg, (batch_size, *input_size, 16), NUM_CLASSES)
+  model, encoder, kernel, optimizer, xform_key, state, projection_obj = create_train_state(cfg, (batch_size, *input_size, 16), NUM_CLASSES, linear=linear, proj_type=proj_type)
   
   print( "Done..." )
 
@@ -302,22 +525,26 @@ def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, load_weight_d
   state = flax_utils.replicate( state )
 
   print( "Distributing..." )
-  p_train_step = jax.pmap( functools.partial(train_fn,
+  p_train_step = jax.pmap( functools.partial(train_step,
                                              model        = model,
                                              encoder      = encoder,
                                              kernel       = kernel,
                                              optimizer    = optimizer,
                                              train        = True,
-                                             linear       = linear),
+                                             linear       = linear,
+                                             projection_obj = projection_obj,
+                                             freeze_encoder = freeze_encoder),
                            axis_name=PMAP_AXIS )
     
-  p_eval_step = jax.pmap( functools.partial(eval_fn,
+  p_eval_step = jax.pmap( functools.partial(train_step,
                                              model        = model,
                                              encoder      = encoder,
                                              kernel       = kernel,
                                              optimizer    = optimizer,
                                              train        = False,
-                                             linear       = linear),
+                                             linear       = linear,
+                                             projection_obj = projection_obj,
+                                             freeze_encoder = freeze_encoder),
                           axis_name=PMAP_AXIS )
   
 
@@ -397,6 +624,8 @@ def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, load_weight_d
 if __name__ == '__main__':
   arguments = docopt(__doc__, version='Train 1.0')
   linear = arguments['--linear']
+  proj_type = arguments['--projection']
+  freeze_encoder = arguments['--freeze-encoder']
 
   # Set up experiment directory
   in_dir = arguments['--in']
@@ -439,5 +668,5 @@ if __name__ == '__main__':
   ic( exp_dir )
 
   
-  train_and_evaluate( cfg, in_dir, exp_dir, weight_dir, linear=linear)
+  train_and_evaluate( cfg, in_dir, exp_dir, weight_dir, linear=linear, proj_type=proj_type, freeze_encoder=freeze_encoder)
 

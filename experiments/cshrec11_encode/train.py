@@ -54,6 +54,32 @@ from data import data_loader as dl
 from data import input_pipeline, xforms
 from utils import ioutils as io
 
+# Linear Projection Module for learnable transformation
+class LinearProjection(nn.Module):
+    op_dim: int
+    
+    @nn.compact
+    def __call__(self, z1, z2):
+        # z1, z2 shape: (batch, num_latents, latent_dim)
+        batch_size, num_latents, latent_dim = z1.shape
+        
+        # Learnable projection matrix: num_latents -> op_dim
+        W = self.param('projection_matrix', 
+                      nn.initializers.normal(stddev=0.01),
+                      (num_latents, self.op_dim))
+        
+        # Create dummy tau (identity transformation)
+        tau = jnp.eye(self.op_dim)[None, :, :].repeat(batch_size, axis=0)
+        
+        # Create Omega components (similar to kernel output format)
+        Omega = (
+            W.T,  # Projection matrix (op_dim, num_latents) for unprojection
+            jnp.ones(self.op_dim),  # Dummy eigenvalues
+            jnp.ones(self.op_dim)   # Dummy scaling factors
+        )
+        
+        return tau, Omega
+
 
 # Constants
 PMAP_AXIS = "batch" 
@@ -102,7 +128,12 @@ def create_train_state( cfg: Any, data_shape: Tuple, linear: bool = False ) -> T
       
   kernel_input = jnp.reshape( dec_input, (dec_input.shape[0], -1,  cfg.LATENT_DIM) )
             
-  kernel = fmaps.operator_iso(op_dim=cfg.KERNEL_OP_DIM)
+  if linear:
+    # Use linear projection instead of kernel
+    kernel = LinearProjection(op_dim=cfg.KERNEL_OP_DIM)
+  else:
+    # Original kernel
+    kernel = fmaps.operator_iso(op_dim=cfg.KERNEL_OP_DIM)
   
   # Initialize
   enc_input     = jnp.ones( data_shape, dtype=jnp.float32 )
@@ -137,14 +168,16 @@ class TrainMetrics(metrics.Collection):
   train_loss        : metrics.Average.from_output("train_loss")
   train_recon_loss    : metrics.Average.from_output("train_recon_loss")
   train_equiv_loss  : metrics.Average.from_output("train_equiv_loss") 
-  train_mult_loss  : metrics.Average.from_output("train_mult_loss") 
+  train_mult_loss  : metrics.Average.from_output("train_mult_loss")
+  train_recon_equiv_loss : metrics.Average.from_output("train_recon_equiv_loss") 
 
 @flax.struct.dataclass
 class EvalMetrics(metrics.Collection):
   eval_loss         : metrics.Average.from_output("eval_loss")
   eval_recon_loss     : metrics.Average.from_output("eval_recon_loss")
   eval_equiv_loss   : metrics.Average.from_output("eval_equiv_loss") 
-  eval_mult_loss   : metrics.Average.from_output("eval_mult_loss") 
+  eval_mult_loss   : metrics.Average.from_output("eval_mult_loss")
+  eval_recon_equiv_loss : metrics.Average.from_output("eval_recon_equiv_loss") 
 
 @jax.jit
 def d4_augment_no_grad(inputs, indices):
@@ -225,25 +258,30 @@ def train_step(x: Any, encoder: nn.Module, decoder: nn.Module, kernel: Any, stat
       Tz_aug = jnp.reshape(Tz_aug_encoded, (batch_size, -1, latent_dim))
       
       # Aggregate latents for decoding: [z0, Tz0, z0_aug, Tz_aug]
-      z_p = jnp.concatenate((z0[:, None, ...], Tz0[:, None, ...], z0_aug[:, None, ...], Tz_aug[:, None, ...]), axis=1)
+      z_p = jnp.concatenate((z0[:, None, ...], Tz0[:, None, ...], 
+                             z0_aug[:, None, ...], Tz_aug[:, None, ...], 
+                             za[:, None, ...], Tza[:, None, ...]), axis=1)
       z_p = jnp.reshape(z_p, (-1, zH, zW, latent_dim))
       
       # Decode all latents
       x_out = decoder.apply({"params": params["decoder"]}, z_p)
-      x_out = jnp.reshape(x_out, (-1, 4, x.shape[1], x.shape[2], x.shape[3]))
+      x_out = jnp.reshape(x_out, (-1, 6, x.shape[1], x.shape[2], x.shape[3]))
       
       # Extract reconstructions
       x0_recon = x_out[:, 0, ...]    # From z0
       Tx_recon = x_out[:, 1, ...]    # From Tz
-      a_recon = x_out[:, 2, ...]     # From z0_aug
-      Ta_recon = x_out[:, 3, ...]    # From Tz_aug
+      z0_aug_recon = x_out[:, 2, ...]     # From z0_aug
+      Tz_aug_recon = x_out[:, 3, ...]    # From Tz_aug
+      a_recon = x_out[:, 4, ...]    # From za
+      Ta_recon = x_out[:, 5, ...]    # From Tza
+
       
       # OPTIMIZED: Batch L1 loss computations to reduce function call overhead
       # Stack targets and outputs for vectorized loss computation
       recon_targets = jnp.stack([x0, Tx, a, Ta])  # Shape: (4, batch_size, H, W, C)
       recon_outputs = jnp.stack([x0_recon, Tx_recon, a_recon, Ta_recon])  # Shape: (4, batch_size, H, W, C)
       recon_weights = jnp.array([1.0, 1.0, 0.5, 0.5])  # Weights for each loss term
-      
+
       # Compute L1 losses in batch: mean over spatial dimensions, then weight and sum
       recon_l1_losses = jnp.mean(jnp.abs(recon_targets - recon_outputs), axis=(2, 3, 4))  # Shape: (4, batch_size)
       loss_recon = jnp.sum(recon_weights[:, None] * recon_l1_losses)  # Weighted sum over loss types and batch
@@ -253,9 +291,16 @@ def train_step(x: Any, encoder: nn.Module, decoder: nn.Module, kernel: Any, stat
       equiv_outputs = jnp.stack([za, Tza])  # Shape: (2, batch_size, num_latents, latent_dim)
       equiv_l1_losses = jnp.mean(jnp.abs(equiv_targets - equiv_outputs), axis=(2, 3))  # Shape: (2, batch_size)
       loss_equiv = jnp.sum(equiv_l1_losses)  # Sum over both loss types and batch
-      
+
+
+      recon_equiv_targets = jnp.stack([a, Ta])
+      recon_equiv_outputs = jnp.stack([z0_aug_recon, Tz_aug_recon])
+      recon_equiv_l1_losses = jnp.mean(jnp.abs(recon_equiv_targets - recon_equiv_outputs), axis=(2, 3, 4))  # Shape: (2, batch_size)
+      recon_equiv = jnp.sum(recon_equiv_l1_losses)  # Sum over both loss types and batch
+
+
       loss_mult = 0.0
-      loss = loss_recon + alpha_equiv * loss_equiv
+      loss = loss_recon + 0.5 * loss_equiv + 0.8 * recon_equiv
       
       # Return dummy values for consistency with kernel mode
       batch_size = z0.shape[0]
@@ -267,7 +312,7 @@ def train_step(x: Any, encoder: nn.Module, decoder: nn.Module, kernel: Any, stat
           jnp.zeros((num_latents,), dtype=jnp.float32)
       )
       
-      return loss, (loss_recon, loss_equiv, loss_mult, z_p, x_out, tauOmegaBA, Omega)
+      return loss, (loss_recon, loss_equiv, loss_mult, recon_equiv, z_p, x_out, tauOmegaBA, Omega)
     else:
       # KERNEL MODE: original logic
       z = encoder.apply({"params": params["encoder"]}, x)
@@ -308,13 +353,15 @@ def train_step(x: Any, encoder: nn.Module, decoder: nn.Module, kernel: Any, stat
       loss_recon = losses.l1_loss(x0, x0b_p) + losses.l1_loss(Tx0, Tx0b_p)
       # Total loss
       loss = loss_recon + alpha_equiv * loss_equiv + beta_mult * loss_mult
-      return loss, (loss_recon, loss_equiv, loss_mult, z_p, x_out, tauOmegaBA, Omega)
+      # For compatibility with linear mode, add dummy recon_equiv
+      recon_equiv = 0.0
+      return loss, (loss_recon, loss_equiv, loss_mult, recon_equiv, z_p, x_out, tauOmegaBA, Omega)
 
   if train: 
     # Compute gradient
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 
-    (loss, (loss_recon, loss_equiv, loss_mult, z, x_out, tauOmega, Omega)), grad = grad_fn(state.params)
+    (loss, (loss_recon, loss_equiv, loss_mult, recon_equiv, z, x_out, tauOmega, Omega)), grad = grad_fn(state.params)
 
 
     grad = jax.lax.pmean(grad, axis_name=PMAP_AXIS)
@@ -336,16 +383,18 @@ def train_step(x: Any, encoder: nn.Module, decoder: nn.Module, kernel: Any, stat
     metrics_update = updater(train_loss         = loss, 
                              train_recon_loss   = loss_recon,
                              train_equiv_loss   = loss_equiv, 
-                             train_mult_loss    = loss_mult)
+                             train_mult_loss    = loss_mult,
+                             train_recon_equiv_loss = recon_equiv)
                              
   else:
-    loss, (loss_recon, loss_equiv, loss_mult, z, x_out, tauOmega, Omega) = loss_fn(state.params) 
+    loss, (loss_recon, loss_equiv, loss_mult, recon_equiv, z, x_out, tauOmega, Omega) = loss_fn(state.params) 
 
 
     metrics_update = EvalMetrics.single_from_model_output(eval_loss         = loss, 
                                                           eval_recon_loss   = loss_recon,
                                                           eval_equiv_loss   = loss_equiv,
-                                                          eval_mult_loss    = loss_mult)
+                                                          eval_mult_loss    = loss_mult,
+                                                          eval_recon_equiv_loss = recon_equiv)
                                                          
     new_state = state.replace(key=key)
     
@@ -435,7 +484,7 @@ def viz_results( cfg, z, batch, x_out, tauOmega, Omega, mode="train", std_factor
   x_out = x_outT[..., None]
   batch = batchT[..., None]
   
-  [x0, gx0, x0_p, gx0_p] = jnp.split(x_out, 4, axis=1) 
+  [x0, gx0, x0_p, gx0_p, a, b] = jnp.split(x_out, 6, axis=1) 
 
   x_out, x_out_p = jnp.concatenate((x0, gx0), axis=1), jnp.concatenate((x0_p, gx0_p), axis=1) 
 
