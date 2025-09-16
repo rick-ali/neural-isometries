@@ -167,9 +167,7 @@ class GeometricProjection(nn.Module):
             # Use MLP projection with 2 dense layers
             # First layer: project latent features 
             x = nn.Dense(self.target_spatial_dim)(x)
-            x = nn.relu(x)
-            # Second layer: keep same dimension
-            x = nn.Dense(self.target_spatial_dim)(x)
+            x = nn.silu(x)
             
             # Now project spatial dimension from enc_spatial_dim to target_spatial_dim
             x = nn.Dense(self.target_spatial_dim)(x.transpose(0, 2, 1)).transpose(0, 2, 1)
