@@ -55,31 +55,22 @@ from data import data_loader as dl
 from data import input_pipeline, xforms
 from utils import ioutils as io
 
-# Linear Projection Module for learnable transformation
+# Simple Linear Projection Module for dimensionality reduction
 class LinearProjection(nn.Module):
     op_dim: int
-    
+
     @nn.compact
-    def __call__(self, z1, z2):
-        # z1, z2 shape: (batch, num_latents, latent_dim)
-        batch_size, num_latents, latent_dim = z1.shape
+    def __call__(self, x, *args):
+        # Accept multiple arguments for interface compatibility, but only use the first
+        # x has shape (batch_size, num_latents, latent_dim)
+        batch_size, num_latents, latent_dim = x.shape
         
-        # Learnable projection matrix: num_latents -> op_dim
+        # Orthogonal projection matrix W: projects from num_latents to op_dim
         W = self.param('projection_matrix', 
-                      nn.initializers.normal(stddev=0.01),
-                      (num_latents, self.op_dim))
+                      nn.initializers.orthogonal(),
+                      (self.op_dim, num_latents))
         
-        # Create dummy tau (identity transformation)
-        tau = jnp.eye(self.op_dim)[None, :, :].repeat(batch_size, axis=0)
-        
-        # Create Omega components (similar to kernel output format)
-        Omega = (
-            W.T,  # Projection matrix (op_dim, num_latents) for unprojection
-            jnp.ones(self.op_dim),  # Dummy eigenvalues
-            jnp.ones(self.op_dim)   # Dummy scaling factors
-        )
-        
-        return tau, Omega
+        return W
 
 
 # Constants
@@ -239,7 +230,7 @@ def train_step(x: Any, encoder: nn.Module, decoder: nn.Module, kernel: Any, stat
   
   def loss_fn(params):
     if linear:      
-      # LINEAR MODE: Augmentation with equivariance learning (EFFICIENT VERSION)
+      # LINEAR MODE: Dimensionality reduction with augmentation-based equivariance
       # Extract original and transformed images from x
       x_pairs = jnp.reshape(x, (-1, 2, x.shape[1], x.shape[2], x.shape[3]))
       x0 = x_pairs[:, 0]  # Original images
@@ -247,109 +238,133 @@ def train_step(x: Any, encoder: nn.Module, decoder: nn.Module, kernel: Any, stat
       batch_size = x0.shape[0]
       double_indices = jnp.tile(aug_indices, 2)  # Repeat indices for both x0 and Tx
       
-      # EFFICIENT: Apply augmentations in batched mode
-      # Stack inputs and indices for single augmentation call
+      # Apply augmentations to images
       aug_inputs = jnp.concatenate([x0, Tx], axis=0)  # Shape: (batch_size * 2, H, W, C)
-      
-      # Single augmentation call for both x0 and Tx using chosen method
       aug_outputs = augment_fn(aug_inputs, double_indices)
       
       # Split augmentation results
-      a = aug_outputs[:batch_size, ...]   # From x0
-      Ta = aug_outputs[batch_size:, ...]  # From Tx
+      a = aug_outputs[:batch_size, ...]   # Augmented x0
+      Ta = aug_outputs[batch_size:, ...]  # Augmented Tx
       
-      # EFFICIENT: Stack all inputs for single encoder forward pass
-      # Shape: (batch_size * 4, H, W, C) where the 4 inputs are [x0, Tx, a, Ta]
+      # Encode all inputs: [x0, Tx, a, Ta]
       all_inputs = jnp.concatenate([x0, Tx, a, Ta], axis=0)
-      
-      # Single encoder forward pass for all inputs
       all_z = encoder.apply({"params": params["encoder"]}, all_inputs)
       zH, zW, latent_dim = all_z.shape[1], all_z.shape[2], all_z.shape[3]
+      num_latents = zH * zW
       
-      # Split the encoded results back into individual components
+      # Split encoded results
       all_z_flat = jnp.reshape(all_z, (batch_size, 4, zH, zW, latent_dim))
       z0_encoded = all_z_flat[:, 0, ...]  # From x0
       Tz0_encoded = all_z_flat[:, 1, ...]  # From Tx
-      za = all_z_flat[:, 2, ...]  # From a
-      Tza = all_z_flat[:, 3, ...]  # From Ta
+      za_encoded = all_z_flat[:, 2, ...]  # From a (augmented x0)
+      Tza_encoded = all_z_flat[:, 3, ...]  # From Ta (augmented Tx)
       
-      # Reshape for further processing
-      z0 = jnp.reshape(z0_encoded, (batch_size, -1, latent_dim))
-      Tz0 = jnp.reshape(Tz0_encoded, (batch_size, -1, latent_dim))
-      za = jnp.reshape(za, (batch_size, -1, latent_dim))
-      Tza = jnp.reshape(Tza, (batch_size, -1, latent_dim))
+      # Reshape to flat format for matrix operations: (batch, num_latents, latent_dim)
+      z0 = jnp.reshape(z0_encoded, (batch_size, num_latents, latent_dim))
+      Tz0 = jnp.reshape(Tz0_encoded, (batch_size, num_latents, latent_dim))
+      za = jnp.reshape(za_encoded, (batch_size, num_latents, latent_dim))
+      Tza = jnp.reshape(Tza_encoded, (batch_size, num_latents, latent_dim))
       
-      # EFFICIENT: Apply D4 transformation to latent features in batched mode
-      # Stack encoded features for single augmentation call
-      latent_aug_inputs = jnp.concatenate([z0_encoded, Tz0_encoded], axis=0)  # Shape: (batch_size * 2, zH, zW, latent_dim)
+      # Get learnable projection matrix W
+      W = kernel.apply({"params": params["kernel"]}, z0)  # Use z0 as dummy input, returns (op_dim, num_latents)
       
-      # Single D4 augmentation call for both z0 and Tz0
+      # Project all latents to lower dimensional space using W
+      z0_proj = jnp.einsum("ij,bjk->bik", W, z0)         # (batch, op_dim, latent_dim)
+      Tz0_proj = jnp.einsum("ij,bjk->bik", W, Tz0)       # (batch, op_dim, latent_dim)
+      za_proj = jnp.einsum("ij,bjk->bik", W, za)         # (batch, op_dim, latent_dim)
+      Tza_proj = jnp.einsum("ij,bjk->bik", W, Tza)       # (batch, op_dim, latent_dim)
+      
+      # Determine spatial dimensions for projected space
+      # Since W.shape[0] is static (op_dim), we can compute this at trace time
+      import math
+      op_dim_static = int(W.shape[0])  # This works since shape is known at trace time
+      proj_h = int(math.sqrt(op_dim_static))
+      proj_w = op_dim_static // proj_h
+      
+      # Reshape projected latents to spatial format
+      z0_proj_encoded = jnp.reshape(z0_proj, (batch_size, proj_h, proj_w, latent_dim))
+      Tz0_proj_encoded = jnp.reshape(Tz0_proj, (batch_size, proj_h, proj_w, latent_dim))
+      
+      # Apply augmentations to PROJECTED latent features (SAME AS ORIGINAL BUT ON PROJECTED)
+      latent_aug_inputs = jnp.concatenate([z0_proj_encoded, Tz0_proj_encoded], axis=0)  # (batch_size * 2, proj_h, proj_w, latent_dim)
       latent_aug_outputs = augment_fn(latent_aug_inputs, double_indices)
-
-      # Split latent augmentation results
-      z0_aug_encoded = latent_aug_outputs[:batch_size, ...]   # From z0_encoded
-      Tz_aug_encoded = latent_aug_outputs[batch_size:, ...]   # From Tz0_encoded
       
-      # Reshape augmented latents for further processing
+      # Split latent augmentation results and reshape (SAME AS ORIGINAL)
+      z0_aug_encoded = latent_aug_outputs[:batch_size, ...]   # From z0_proj_encoded
+      Tz_aug_encoded = latent_aug_outputs[batch_size:, ...]   # From Tz0_proj_encoded  
       z0_aug = jnp.reshape(z0_aug_encoded, (batch_size, -1, latent_dim))
       Tz_aug = jnp.reshape(Tz_aug_encoded, (batch_size, -1, latent_dim))
       
-      # Aggregate latents for decoding: [z0, Tz0, z0_aug, Tz_aug]
-      z_p = jnp.concatenate((z0[:, None, ...], Tz0[:, None, ...], 
-                             z0_aug[:, None, ...], Tz_aug[:, None, ...], 
-                             za[:, None, ...], Tza[:, None, ...]), axis=1)
-      z_p = jnp.reshape(z_p, (-1, zH, zW, latent_dim))
+      # Your geometric learning goes here in the projected space!
+      # For now, just pass through (identity transformation)
+      z0_transformed = z0_proj
+      Tz0_transformed = Tz0_proj
+      za_transformed = za_proj
+      Tza_transformed = Tza_proj
+      z0_aug_transformed = z0_aug  # Augmented in projected space: (batch, op_dim, latent_dim)
+      Tz0_aug_transformed = Tz_aug  # Augmented in projected space: (batch, op_dim, latent_dim)
+      
+      # Project back to original space using W^T for decoder compatibility
+      z0_reconstructed = jnp.einsum("ij,bjk->bik", W.T, z0_transformed)    # (batch, num_latents, latent_dim)
+      Tz0_reconstructed = jnp.einsum("ij,bjk->bik", W.T, Tz0_transformed)  # (batch, num_latents, latent_dim)
+      za_reconstructed = jnp.einsum("ij,bjk->bik", W.T, za_transformed)    # (batch, num_latents, latent_dim)
+      Tza_reconstructed = jnp.einsum("ij,bjk->bik", W.T, Tza_transformed)  # (batch, num_latents, latent_dim)
+      z0_aug_reconstructed = jnp.einsum("ij,bjk->bik", W.T, z0_aug_transformed)  # (batch, num_latents, latent_dim)
+      Tz0_aug_reconstructed = jnp.einsum("ij,bjk->bik", W.T, Tz0_aug_transformed) # (batch, num_latents, latent_dim)
+      
+      # Prepare for decoder: reshape back to spatial format
+      z_for_decode = jnp.stack([z0_reconstructed, Tz0_reconstructed, 
+                               za_reconstructed, Tza_reconstructed,
+                               z0_aug_reconstructed, Tz0_aug_reconstructed], axis=1)
+      z_p = jnp.reshape(z_for_decode, (-1, zH, zW, latent_dim))  # (batch*6, zH, zW, latent_dim)
       
       # Decode all latents
       x_out = decoder.apply({"params": params["decoder"]}, z_p)
       x_out = jnp.reshape(x_out, (-1, 6, x.shape[1], x.shape[2], x.shape[3]))
       
       # Extract reconstructions
-      x0_recon = x_out[:, 0, ...]    # From z0
-      Tx_recon = x_out[:, 1, ...]    # From Tz
-      z0_aug_recon = x_out[:, 2, ...]     # From z0_aug
-      Tz_aug_recon = x_out[:, 3, ...]    # From Tz_aug
-      a_recon = x_out[:, 4, ...]    # From za
-      Ta_recon = x_out[:, 5, ...]    # From Tza
-
+      x0_recon = x_out[:, 0, ...]        # From z0_reconstructed
+      Tx_recon = x_out[:, 1, ...]        # From Tz0_reconstructed
+      a_recon = x_out[:, 2, ...]         # From za_reconstructed
+      Ta_recon = x_out[:, 3, ...]        # From Tza_reconstructed
+      z0_aug_recon = x_out[:, 4, ...]    # From z0_aug_reconstructed
+      Tz0_aug_recon = x_out[:, 5, ...]   # From Tz0_aug_reconstructed
       
-      # OPTIMIZED: Batch L1 loss computations to reduce function call overhead
-      # Stack targets and outputs for vectorized loss computation
-      recon_targets = jnp.stack([x0, Tx, a, Ta])  # Shape: (4, batch_size, H, W, C)
-      recon_outputs = jnp.stack([x0_recon, Tx_recon, a_recon, Ta_recon])  # Shape: (4, batch_size, H, W, C)
-      recon_weights = jnp.array([1.0, 1.0, 0.5, 0.5])  # Weights for each loss term
-
-      # Compute L1 losses in batch: mean over spatial dimensions, then weight and sum
-      recon_l1_losses = jnp.mean(jnp.abs(recon_targets - recon_outputs), axis=(2, 3, 4))  # Shape: (4, batch_size)
-      loss_recon = jnp.sum(recon_weights[:, None] * recon_l1_losses)  # Weighted sum over loss types and batch
+      # Compute losses
+      # Reconstruction loss
+      recon_targets = jnp.stack([x0, Tx, a, Ta])
+      recon_outputs = jnp.stack([x0_recon, Tx_recon, a_recon, Ta_recon])
+      recon_weights = jnp.array([1.0, 1.0, 0.5, 0.5])
+      recon_l1_losses = jnp.mean(jnp.abs(recon_targets - recon_outputs), axis=(2, 3, 4))
+      loss_recon = jnp.sum(recon_weights[:, None] * recon_l1_losses)
       
-      # Batch equiv losses similarly
-      equiv_targets = jnp.stack([z0_aug, Tz_aug])  # Shape: (2, batch_size, num_latents, latent_dim)
-      equiv_outputs = jnp.stack([za, Tza])  # Shape: (2, batch_size, num_latents, latent_dim)
-      equiv_l1_losses = jnp.mean(jnp.abs(equiv_targets - equiv_outputs), axis=(2, 3))  # Shape: (2, batch_size)
-      loss_equiv = jnp.sum(equiv_l1_losses)  # Sum over both loss types and batch
-      # equiv_l2_losses = jnp.mean((equiv_targets - equiv_outputs)**2, axis=(2, 3))  # Shape: (2, batch_size)
-      # loss_equiv = jnp.sum(equiv_l2_losses)  # Sum over both loss types and batch
-
-
+      # Equivariance loss in projected space: augment→project ≈ project→augment
+      equiv_loss_z0 = jnp.mean(jnp.abs(z0_aug - za_proj))
+      equiv_loss_Tz0 = jnp.mean(jnp.abs(Tz_aug - Tza_proj))
+      loss_equiv = equiv_loss_z0 + equiv_loss_Tz0
+      
+      # Reconstruction equivariance: check if augmented reconstructions match
       recon_equiv_targets = jnp.stack([a, Ta])
-      recon_equiv_outputs = jnp.stack([z0_aug_recon, Tz_aug_recon])
-      recon_equiv_l1_losses = jnp.mean(jnp.abs(recon_equiv_targets - recon_equiv_outputs), axis=(2, 3, 4))  # Shape: (2, batch_size)
-      recon_equiv = jnp.sum(recon_equiv_l1_losses)  # Sum over both loss types and batch
-
-
-      loss_mult = 0.0
-      loss = loss_recon + 0.5 * loss_equiv + 0.8 * recon_equiv
+      recon_equiv_outputs = jnp.stack([z0_aug_recon, Tz0_aug_recon])
+      recon_equiv_l1_losses = jnp.mean(jnp.abs(recon_equiv_targets - recon_equiv_outputs), axis=(2, 3, 4))
+      recon_equiv = jnp.sum(recon_equiv_l1_losses)
       
-      # Return dummy values for consistency with kernel mode
-      batch_size = z0.shape[0]
-      num_latents = z0.shape[1]
-      tauOmegaBA = jnp.zeros((batch_size, num_latents, num_latents), dtype=jnp.float32)
-      Omega = (
-          jnp.zeros((num_latents, num_latents), dtype=jnp.float32),
-          jnp.zeros((num_latents,), dtype=jnp.float32),
-          jnp.zeros((num_latents,), dtype=jnp.float32)
-      )
+      # Orthogonality regularization for W
+      WWT = jnp.matmul(W, W.T)  # Should be close to identity for orthogonal W
+      I = jnp.eye(W.shape[0])
+      orth_loss = jnp.mean((WWT - I) ** 2)
+      
+      # Total loss
+      loss_mult = orth_loss
+      loss = loss_recon + 0.5 * loss_equiv + 0.8 * recon_equiv + 0.1 * loss_mult
+      
+      # Outputs for compatibility - make W look like Phi for visualization
+      # In linear mode: W has shape (op_dim, num_latents)
+      # For viz compatibility: treat W.T as Phi (num_latents, op_dim)
+      tauOmegaBA = jnp.zeros((batch_size, W.shape[0], W.shape[0]))
+      Phi_compat = W.T  # (num_latents, op_dim) like original Phi
+      Lambda_compat = jnp.ones(W.shape[0])  # (op_dim,) like original Lambda
+      Omega = (Phi_compat, Lambda_compat, Lambda_compat)
       
       return loss, (loss_recon, loss_equiv, loss_mult, recon_equiv, z_p, x_out, tauOmegaBA, Omega)
     else:
@@ -673,10 +688,10 @@ def viz_results( cfg, z, batch, x_out, tauOmega, Omega, mode="train", std_factor
   
     os.makedirs(input_dir, exist_ok=True)
   
-    for k in range(xIm.shape[0]):
+    for k in range(x.shape[0]):
       
-      io.save_png(np.asarray(xIm[k, ...]), os.path.join(input_dir, "x0_{}.png".format(k)))
-      io.save_png(np.asarray(gxIm[k, ...]), os.path.join(input_dir, "gx0_{}.png".format(k)))
+      io.save_png(np.asarray(x[k, ...]), os.path.join(input_dir, "x0_{}.png".format(k)))
+      io.save_png(np.asarray(gx[k, ...]), os.path.join(input_dir, "gx0_{}.png".format(k)))
       
     np.savez(os.path.join(learned_dir, "raw.npz"), op=O, Phi=Phi_eigs, tau=tauOmega)
                    

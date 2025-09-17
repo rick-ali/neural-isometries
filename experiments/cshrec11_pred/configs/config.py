@@ -48,6 +48,9 @@ LR              = 5.0e-4
 END_LR          = 5.0e-5
 WARMUP_STEPS    = 2000 
 
+# Pretrained projection matrix learning rate scaling
+PRETRAINED_PROJECTION_LR_SCALE = 0.1  # Use 10x lower learning rate for pretrained projection matrix
+
 EVAL_EVERY     = 5000
 LOG_LOSS_EVERY = 100
 VIZ_EVERY      = 2500

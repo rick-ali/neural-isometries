@@ -3,7 +3,7 @@
 Train.
 
 Usage:
-  train [options] [--linear] [--projection=<type>] [--freeze-encoder]
+  train [options] [--linear] [--projection=<type>] [--freeze-encoder] [--pretrained-matrix]
   train (-h | --help)
   train --version
 
@@ -11,6 +11,7 @@ Options:
   --linear                Use linear latent transformation (matrix W) instead of kernel (default: False).
   --projection=<type>     Projection type for linear mode: matrix, mlp, or conv [default: matrix].
   --freeze-encoder        Freeze encoder weights during training (default: True).
+  --pretrained-matrix     Load pretrained projection matrix from checkpoint when in linear mode (default: False).
   -h --help                   Show this screen.
   --version                   Show version.
   -i, --in=<input_dir>        Input directory [default: {root_path}/data/CSHREC_11/].
@@ -45,6 +46,7 @@ print(jax.default_backend(), flush=True)
 tf.config.experimental.set_visible_devices( [], 'GPU' )
 
 from flax.core.frozen_dict import freeze 
+from flax import traverse_util
 from docopt import docopt
 from typing import Any, Callable, Dict, Sequence, Tuple, Union
 from clu import checkpoint, metric_writers, metrics, parameter_overview, periodic_actions
@@ -187,7 +189,7 @@ class TrainState:
   key          : Any 
 
 
-def create_train_state( cfg: Any, data_shape: Tuple, num_classes: int, linear: bool = False, proj_type: str = "matrix") -> Tuple[nn.Module, Any, Any, Any,  Any, TrainState, Any]:
+def create_train_state( cfg: Any, data_shape: Tuple, num_classes: int, linear: bool = False, proj_type: str = "matrix", pretrained_matrix: bool = False) -> Tuple[nn.Module, Any, Any, Any,  Any, TrainState, Any]:
 
   # Random key 
   seed = 0 #np.random.randint(low=0, high=1e8, size=(1, ))[0]
@@ -238,8 +240,21 @@ def create_train_state( cfg: Any, data_shape: Tuple, num_classes: int, linear: b
     # Create projection based on type
     if proj_type == "matrix":
       # Simple matrix projection (backward compatibility)
-      proj_key, model_key = jax.random.split(model_key)
-      projection_matrix = jax.random.normal(proj_key, (enc_spatial_dim, cfg.KERNEL_OP_DIM)) * 0.01
+      if pretrained_matrix and "kernel" in ae_state["params"] and "projection_matrix" in ae_state["params"]["kernel"]:
+        # Load pretrained projection matrix from checkpoint
+        pretrained_W = ae_state["params"]["kernel"]["projection_matrix"] 
+        # W has shape (op_dim, num_latents), we need (num_latents, op_dim)
+        # Transpose once during initialization to avoid repeated transposes
+        # Use copy() to ensure contiguous memory layout for optimal performance
+        projection_matrix = jnp.array(pretrained_W.T, copy=True)
+        print(f"Loaded and transposed pretrained projection matrix, shape: {projection_matrix.shape}")
+        print(f"Matrix memory layout optimized: {projection_matrix.flags if hasattr(projection_matrix, 'flags') else 'JAX array'}")
+      else:
+        # Initialize new projection matrix
+        proj_key, model_key = jax.random.split(model_key)
+        projection_matrix = jax.random.normal(proj_key, (enc_spatial_dim, cfg.KERNEL_OP_DIM)) * 0.01
+        if pretrained_matrix:
+          print("Warning: --pretrained-matrix specified but no projection_matrix found in checkpoint. Using random initialization.")
       projection_obj = None
     else:
       # Calculate actual encoder spatial dimensions (zH, zW)
@@ -285,17 +300,53 @@ def create_train_state( cfg: Any, data_shape: Tuple, num_classes: int, linear: b
     params = {"encoder": enc_params, "kernel": kernel_params, "model": model_params} 
 
 
-  # Set up optimizer 
-  schedule = optax.warmup_cosine_decay_schedule( init_value   = cfg.INIT_LR,
-                                                 peak_value   = cfg.LR,
-                                                 warmup_steps = cfg.WARMUP_STEPS,
-                                                 decay_steps  = cfg.NUM_TRAIN_STEPS,
-                                                 end_value    = cfg.END_LR )
+  # Set up optimizer with potential separate learning rates
+  main_schedule = optax.warmup_cosine_decay_schedule( init_value   = cfg.INIT_LR,
+                                                      peak_value   = cfg.LR,
+                                                      warmup_steps = cfg.WARMUP_STEPS,
+                                                      decay_steps  = cfg.NUM_TRAIN_STEPS,
+                                                      end_value    = cfg.END_LR )
 
   batch_size = cfg.BATCH_SIZE
   num_multi_steps = cfg.TRUE_BATCH_SIZE // batch_size  
   
-  optim = optax.adamw( learning_rate=schedule, b1=cfg.ADAM_B1, b2=cfg.ADAM_B2 )
+  # Use separate learning rate for pretrained projection matrix to prevent overfitting
+  if linear and proj_type == "matrix" and pretrained_matrix:
+    # Scale down learning rate for pretrained projection matrix
+    projection_lr_scale = getattr(cfg, 'PRETRAINED_PROJECTION_LR_SCALE', 0.1)  # Default: 10x lower
+    
+    # Create same scheduler pattern but with scaled learning rates
+    projection_schedule = optax.warmup_cosine_decay_schedule( 
+        init_value   = cfg.INIT_LR * projection_lr_scale,
+        peak_value   = cfg.LR * projection_lr_scale,
+        warmup_steps = cfg.WARMUP_STEPS,  # Same warmup schedule
+        decay_steps  = cfg.NUM_TRAIN_STEPS,  # Same decay schedule
+        end_value    = cfg.END_LR * projection_lr_scale )
+    
+    # Create multi-transform optimizer with different learning rates
+    transforms = {
+        'projection': optax.adamw(learning_rate=projection_schedule, b1=cfg.ADAM_B1, b2=cfg.ADAM_B2),
+        'other': optax.adamw(learning_rate=main_schedule, b1=cfg.ADAM_B1, b2=cfg.ADAM_B2)
+    }
+    
+    # Function to determine which optimizer to use for each parameter
+    def param_partition(params):
+        # Use flax's path-aware mapping to identify projection parameters
+        def classify_param(path, param):
+            path_str = '/'.join(str(p) for p in path)
+            return 'projection' if 'projection' in path_str else 'other'
+        
+        return traverse_util.path_aware_map(classify_param, params)
+    
+    optim = optax.multi_transform(transforms, param_partition)
+    
+    print(f"Using separate learning rate schedules:")
+    print(f"  Main parameters (encoder, model, kernel): peak LR = {cfg.LR}")
+    print(f"  Pretrained projection matrix: peak LR = {cfg.LR * projection_lr_scale} (scale: {projection_lr_scale}x)")
+    
+  else:
+    # Standard single optimizer for all parameters
+    optim = optax.adamw( learning_rate=main_schedule, b1=cfg.ADAM_B1, b2=cfg.ADAM_B2 )
   
   optimizer = optax.MultiSteps( optim, num_multi_steps )
   
@@ -334,9 +385,10 @@ def train_step(x: Any, labels: Any, model: nn.Module, encoder: nn.Module, kernel
       # Apply learnable projection from enc_spatial_dim to KERNEL_OP_DIM
       # z shape: (batch, enc_spatial_dim, latent_dim)
       if "projection" in params:
-        # Matrix projection (backward compatibility)
-        # projection_matrix shape: (enc_spatial_dim, KERNEL_OP_DIM)
-        # Result: (batch, KERNEL_OP_DIM, latent_dim)
+        # Matrix projection using einsum for correct dimension handling
+        # z shape: (batch, spatial_dim, latent_dim) = (16, 288, 64)
+        # projection_matrix shape: (spatial_dim, op_dim) = (288, 64)  
+        # Result: (batch, op_dim, latent_dim) = (16, 64, 64)
         z_proj = jnp.einsum('bsl,sk->bkl', z, params["projection"])
       else:
         # Use GeometricProjection (mlp/conv)
@@ -344,14 +396,8 @@ def train_step(x: Any, labels: Any, model: nn.Module, encoder: nn.Module, kernel
       
       logits = model.apply({'params': params["model"]}, z_proj)
       
-      # Return dummy Omega for downstream compatibility
-      batch_size = z.shape[0]
-      num_latents = z.shape[1]
-      Omega = (
-          jnp.zeros((num_latents, num_latents), dtype=jnp.float32),   # Omega[0]
-          jnp.zeros((num_latents,), dtype=jnp.float32),               # Omega[1]
-          jnp.zeros((num_latents,), dtype=jnp.float32)                # Omega[2]
-      )
+      # Return minimal dummy Omega to satisfy interface requirements
+      Omega = None  # Linear mode doesn't need this
     else:
       # KERNEL MODE: original logic
       _, Omega = kernel.apply({"params": params["kernel"]}, z, z)
@@ -402,7 +448,7 @@ def train_step(x: Any, labels: Any, model: nn.Module, encoder: nn.Module, kernel
 
 
        
-def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, load_weight_dir: str, linear: bool = False, proj_type: str = "matrix", freeze_encoder: bool = True):
+def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, load_weight_dir: str, linear: bool = False, proj_type: str = "matrix", freeze_encoder: bool = True, pretrained_matrix: bool = False):
   tf.io.gfile.makedirs( output_dir )
 
   '''
@@ -442,7 +488,10 @@ def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, load_weight_d
   suffixes.append(weight_suffix)
   
   if linear:
-    suffixes.append(f"linear_{proj_type}")
+    linear_suffix = f"linear_{proj_type}"
+    if pretrained_matrix and proj_type == "matrix":
+      linear_suffix += "_pretrained"
+    suffixes.append(linear_suffix)
   else:
     suffixes.append("kernel")
     
@@ -507,7 +556,7 @@ def train_and_evaluate( cfg: Any, input_dir: str, output_dir: str, load_weight_d
   #Create models
   print( "Initializing models..." )    
     
-  model, encoder, kernel, optimizer, xform_key, state, projection_obj = create_train_state(cfg, (batch_size, *input_size, 16), NUM_CLASSES, linear=linear, proj_type=proj_type)
+  model, encoder, kernel, optimizer, xform_key, state, projection_obj = create_train_state(cfg, (batch_size, *input_size, 16), NUM_CLASSES, linear=linear, proj_type=proj_type, pretrained_matrix=pretrained_matrix)
   
   print( "Done..." )
 
@@ -624,6 +673,7 @@ if __name__ == '__main__':
   linear = arguments['--linear']
   proj_type = arguments['--projection']
   freeze_encoder = arguments['--freeze-encoder']
+  pretrained_matrix = arguments['--pretrained-matrix']
 
   # Set up experiment directory
   in_dir = arguments['--in']
@@ -666,5 +716,5 @@ if __name__ == '__main__':
   ic( exp_dir )
 
   
-  train_and_evaluate( cfg, in_dir, exp_dir, weight_dir, linear=linear, proj_type=proj_type, freeze_encoder=freeze_encoder)
+  train_and_evaluate( cfg, in_dir, exp_dir, weight_dir, linear=linear, proj_type=proj_type, freeze_encoder=freeze_encoder, pretrained_matrix=pretrained_matrix)
 
