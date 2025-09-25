@@ -48,7 +48,7 @@ LR              = 5.0e-4
 END_LR          = 5.0e-5
 WARMUP_STEPS    = 2000 
 
-EVAL_EVERY     = 5000
+EVAL_EVERY     = 1000
 LOG_LOSS_EVERY = 100
 VIZ_EVERY      = 2500
 VIZ_SIZE       = INPUT_SIZE
